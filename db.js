@@ -22,6 +22,7 @@ const defaultDate = () => Date.now();
 const replySchema = new Schema({
   text: String,
   created_on: { type: Date, default: defaultDate },
+  bumped_on: { type: Date, default: defaultDate },
   reported: {
     type: Boolean,
     default: false,

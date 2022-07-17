@@ -5,8 +5,7 @@ const bcrypt = require('bcrypt');
 
 module.exports = (app) => {
   const hashPassword = async (password) => {
-    const salt = await bcrypt.genSalt(10);
-    return await bcrypt.hash(password, salt);
+    return await bcrypt.hash(password, await bcrypt.genSalt(10));
   };
 
   const createThreadPayload = (thread) => ({
@@ -20,48 +19,22 @@ module.exports = (app) => {
     _id: reply._id,
     text: reply.text,
     created_on: reply.created_on,
-    reported: reply.reported,
   });
-
-  const getBoardOrThrow = async (name) => {
-    const board = await Board.findOne({ name });
-    if (!board) {
-      throw new Error('Board not found');
-    }
-
-    return board;
-  };
-
-  const getThreadFromBoardOrThrow = async (board, threadId) => {
-    const thread = board.threads.id(threadId);
-    if (!thread) {
-      throw new Error('Thread not found');
-    }
-
-    return thread;
-  };
-
-  const getReplyFromThreadThrow = async (thread, replyId) => {
-    const reply = thread.replies.id(replyId);
-    if (!reply) {
-      throw new Error('Reply not found');
-    }
-
-    return reply;
-  };
 
   app
     .route('/api/threads/:board')
     .get(async (req, res) => {
       try {
-        const { board } = req.body;
+        const { board } = req.params;
 
-        const foundBoard = await getBoardOrThrow(board);
+        const foundBoard = await Board.findOne({ name: board });
         const threads = foundBoard.threads
           .sort((t1, t2) => t2.bumped_on - t1.bumped_on)
+          .slice(0, 10)
           .map((thread) => {
             const replies = thread.replies
-              .sort((r1, r2) => r2.created_on - r1.created_on)
+              .sort((r1, r2) => r2.bumped_on - r1.bumped_on)
+              .slice(0, 3)
               .map((reply) => createReplyPayload(reply));
 
             return {
@@ -78,10 +51,14 @@ module.exports = (app) => {
     })
     .post(async (req, res) => {
       try {
-        const { board, text, delete_password } = req.body;
+        const { board } = req.params;
+        const { text, delete_password } = req.body;
 
-        const thread = await Thread.create({
+        const date = Date.now();
+        const thread = new Thread({
           text,
+          created_on: date,
+          bumped_on: date,
           delete_password: await hashPassword(delete_password),
         });
 
@@ -98,45 +75,50 @@ module.exports = (app) => {
     })
     .put(async (req, res) => {
       try {
-        const { board, thread_id } = req.body;
+        const { board } = req.params;
+        const { thread_id } = req.body;
 
-        const foundBoard = await getBoardOrThrow(board);
-        const foundThread = await getThreadFromBoardOrThrow(
-          foundBoard,
-          thread_id
+        await Board.findOneAndUpdate(
+          { name: board },
+          { id: thread_id, $set: { reported: true } }
         );
 
-        if (foundThread.reported) {
-          res.send('Thread already reported');
-        } else {
-          foundThread.reported = true;
-          await foundBoard.save();
-          res.send('Thread reported');
-        }
+        res.send('reported');
       } catch (err) {
         res.send(err.message);
       }
     })
     .delete(async (req, res) => {
       try {
-        const { board, thread_id, delete_password } = req.body;
+        const { board } = req.params;
+        const { thread_id, delete_password } = req.body;
 
-        const foundBoard = await getBoardOrThrow(board);
-        const foundThread = await getThreadFromBoardOrThrow(
-          foundBoard,
-          thread_id
-        );
+        const foundBoard = await Board.findOne({
+          name: board,
+          'threads._id': thread_id,
+        });
+        if (!foundBoard || !foundBoard.threads) {
+          return res.send('thread not found');
+        }
 
-        const isValidPassword = await bcrypt.compare(
+        const isCorrectPassword = await bcrypt.compare(
           delete_password,
-          foundThread.delete_password
+          foundBoard.threads.id(thread_id).delete_password
         );
-        if (!isValidPassword) {
-          res.send('Incorrect password');
+
+        if (!isCorrectPassword) {
+          return res.send('incorrect password');
+        }
+
+        const result = await Board.deleteOne(
+          { name: board },
+          { id: thread_id }
+        );
+
+        if (result.deletedCount === 0) {
+          res.send('unable to delete thread');
         } else {
-          foundThread.remove();
-          await foundBoard.save();
-          res.send('Thread deleted');
+          res.send('success');
         }
       } catch (err) {
         res.send(err.message);
@@ -147,90 +129,106 @@ module.exports = (app) => {
     .route('/api/replies/:board')
     .get(async (req, res) => {
       try {
-        const { board, thread_id } = req.body;
+        const { board, thread_id } = {
+          ...req.params,
+          ...req.body,
+          ...req.query,
+        };
 
-        const foundBoard = await getBoardOrThrow(board);
-        const foundThread = await getThreadFromBoardOrThrow(
-          foundBoard,
-          thread_id
-        );
+        const foundBoard = await Board.findOne({ name: board });
+        if (!foundBoard || !foundBoard.threads) {
+          return res.send('thread not found');
+        }
+
+        const thread = foundBoard.threads.id(thread_id);
 
         res.json({
-          ...createThreadPayload(foundThread),
-          ...foundThread.replies.map((reply) => createReplyPayload(reply)),
+          ...createThreadPayload(thread),
+          replies: [
+            ...thread.replies.map((reply) => createReplyPayload(reply)),
+          ],
         });
       } catch (err) {
+        console.error(err);
         res.send(err.message);
       }
     })
     .post(async (req, res) => {
       try {
-        const { board, text, thread_id, delete_password } = req.body;
+        const { board } = req.params;
+        const { text, thread_id, delete_password } = req.body;
 
-        const foundBoard = await getBoardOrThrow(board);
-        const foundThread = await getThreadFromBoardOrThrow(
-          foundBoard,
-          thread_id
-        );
+        const foundBoard = await Board.findOne({ name: board });
+        if (!foundBoard || !foundBoard.threads) {
+          return res.send('thread not found');
+        }
 
+        const thread = foundBoard.threads.id(thread_id);
+
+        const date = Date.now();
         const newReply = new Reply({
           text,
+          created_on: date,
+          bumped_on: date,
           delete_password: await hashPassword(delete_password),
-          created_on: Date.now(),
         });
 
-        foundThread.bumped_on = newReply.created_on;
-        foundThread.replies.push(newReply);
+        thread.bumped_on = date;
+        thread.replies.push(newReply);
         await foundBoard.save();
 
-        res.json(foundThread);
+        res.json(thread);
       } catch (err) {
         res.send(err.message);
       }
     })
     .put(async (req, res) => {
       try {
-        const { board, thread_id, reply_id } = req.body;
+        const { board } = req.params;
+        const { thread_id, reply_id } = req.body;
 
-        const foundBoard = await getBoardOrThrow(board);
-        const foundThread = await getThreadFromBoardOrThrow(
-          foundBoard,
-          thread_id
+        await Board.findOneAndUpdate(
+          { name: board },
+          { id: thread_id, 'replies._id': reply_id },
+          { $set: { 'replies.$.reported': true } }
         );
-        const foundReply = await getReplyFromThreadThrow(foundThread, reply_id);
-        if (foundReply.reported) {
-          res.send('Reply already reported');
-        } else {
-          foundReply.reported = true;
-          await foundBoard.save();
-          res.send('Reply reported');
-        }
+
+        res.send('reported');
       } catch (err) {
         res.send(err.message);
       }
     })
     .delete(async (req, res) => {
       try {
-        const { board, thread_id, reply_id, delete_password } = req.body;
+        const { board } = req.params;
+        const { thread_id, reply_id, delete_password } = req.body;
 
-        const foundBoard = await getBoardOrThrow(board);
-        const foundThread = await getThreadFromBoardOrThrow(
-          foundBoard,
-          thread_id
-        );
-        const foundReply = await getReplyFromThreadThrow(foundThread, reply_id);
+        const foundBoard = await Board.findOne({
+          name: board,
+          'threads._id': thread_id,
+        });
 
-        const isValidPassword = await bcrypt.compare(
-          delete_password,
-          foundReply.delete_password
-        );
-        if (!isValidPassword) {
-          return res.send('Incorrect password');
+        if (!foundBoard || !foundBoard.threads) {
+          return res.send('thread not found');
         }
 
-        foundReply.text = '[deleted]';
+        const reply = foundBoard.threads.id(thread_id).replies.id(reply_id);
+        if (!reply) {
+          return res.send('reply not found');
+        }
+
+        const isCorrectPassword = await bcrypt.compare(
+          delete_password,
+          reply.delete_password
+        );
+
+        if (!isCorrectPassword) {
+          return res.send('incorrect password');
+        }
+
+        reply.text = '[deleted]';
         await foundBoard.save();
-        res.send('Reply deleted');
+        res.send('success');
       } catch (err) {
         res.send(err.message);
       }
